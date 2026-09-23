@@ -1,0 +1,33 @@
+__pycache__/
+*.pyc
+*.pyo
+.gradio/
+.env
+.env.*
+*.log
+
+# 本地配置含数据库密码，不要提交。用 config.example.yaml 作为模板。
+config.yaml
+
+# 权重约 690MB，单独拷贝，不要推进 Git。
+*.safetensors
+*.weights.lock
+models/grounding-dino-tiny/*
+!models/grounding-dino-tiny/.gitkeep
+
+data/images/*
+!data/images/.gitkeep
+data/annotations/*
+!data/annotations/.gitkeep
+data/previews/*
+!data/previews/.gitkeep
+data/exports/*
+!data/exports/.gitkeep
+data/labels/
+data/users/
+
+logs/
+.claude/
+.idea/
+.vscode/
+*.zip

@@ -1,0 +1,69 @@
+# 复制为 config.yaml 后再改。config.yaml 含密码，不要提交到 Git。
+model:
+  # 只用项目内本地权重，不会联网下载。
+  id: models/grounding-dino-tiny
+  local_files_only: true
+  # auto = 有 GPU 就用 GPU；cpu 强制 CPU。
+  # 多卡时写 cuda:0 / cuda:1，或 device: cuda + gpu_id: 1。
+  device: auto          # auto | cpu | cuda | cuda:0 | cuda:1
+  gpu_id: 0             # 界面单张预览默认卡
+  dtype: auto           # auto | float16 | float32
+
+inference:
+  box_threshold: 0.35
+  text_threshold: 0.25
+  nms_iou: 0.50
+  max_detections: 100
+  # 一次送进模型的类别数。超过则分组前向。
+  chunk_size: 32
+
+paths:
+  images: data/images             # 未登录 / CLI 默认
+  annotations: data/annotations
+  previews: data/previews
+  exports: data/exports
+  users: data/users               # 登录后按用户、按任务分目录
+
+export:
+  format: yolo          # yolo | coco | labelme | all
+  save_preview: true
+
+cleanup:
+  keep_days: 7
+  include_exports: true
+  on_startup: false     # true 则启动 UI 时顺手清一次
+
+ui:
+  server_name: 0.0.0.0
+  server_port: 7860
+  share: false
+  inbrowser: false
+
+# 批量任务走 Redis。python app.py 启动时会按 replicas 在同一张卡上拉起多份模型。
+# 也可以单独跑 python start_workers.py（不要和 app.py 同时各起一套，会翻倍占显存）。
+redis:
+  enabled: false
+  host: 127.0.0.1
+  port: 6379
+  db: 0
+  password: ""
+  prefix: gdino
+  socket_timeout: 5
+
+workers:
+  gpu_id: 0
+  # tiny 大约每份 1.5–2GB 显存。8 份会把卡挤满、互相抢，吞吐往往不如 2–3 份。
+  replicas: 2
+  lease_seconds: 180    # running 心跳超时后才允许别人抢走 / 重启回收
+
+# 账号 / 任务台账。图仍在磁盘，进度和用户在 Postgres。
+# 启动时会自动建表，并确保默认管理员存在。
+postgres:
+  enabled: false
+  host: 127.0.0.1
+  port: 5432
+  db: gdino
+  user: gdino
+  password: "CHANGE_ME"
+  admin_username: admin
+  admin_password: "CHANGE_ME"     # 仅在 users 表还没有该用户时写入；登录后立刻改密

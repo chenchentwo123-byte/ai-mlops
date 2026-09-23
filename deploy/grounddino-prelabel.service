@@ -1,0 +1,39 @@
+[Unit]
+Description=Grounding DINO prelabel (Gradio + same-GPU workers)
+After=network-online.target redis-server.service redis.service postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=YOUR_USER
+Group=YOUR_USER
+WorkingDirectory=/opt/grounddino_prelabel
+
+Environment=HOME=/home/YOUR_USER
+Environment=USER=YOUR_USER
+Environment=LANG=C.UTF-8
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=/opt/grounddino_prelabel
+Environment=PATH=/opt/conda/envs/yolo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=HF_HUB_OFFLINE=1
+Environment=TRANSFORMERS_OFFLINE=1
+Environment=HF_HUB_DISABLE_TELEMETRY=1
+
+ExecStart=/opt/conda/envs/yolo/bin/python -u app.py
+ExecStop=/bin/kill -TERM $MAINPID
+TimeoutStartSec=0
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=8
+KillMode=control-group
+KillSignal=SIGTERM
+
+LimitNOFILE=65535
+Nice=5
+
+StandardOutput=append:/opt/grounddino_prelabel/logs/app.log
+StandardError=append:/opt/grounddino_prelabel/logs/app.err.log
+SyslogIdentifier=grounddino-prelabel
+
+[Install]
+WantedBy=multi-user.target
