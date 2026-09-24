@@ -1,16 +1,22 @@
-# Grounding DINO 提示词预标注
+# Grounding DINO / YOLOE 预标注
 
-用 [Grounding DINO](https://github.com/IDEA-Research/GroundingDINO) 按**文本提示词**对图片做开放词汇检测：画框可视化、写入规范标注，需要时再导出 YOLO / COCO / LabelMe。
+两种预标方式，写出**同一套规范 JSON**，再导出 YOLO / COCO / LabelMe：
 
-适合室内、工地、自定义类别还没有训练数据时，先用提示词批量预标，再人工改。
+| 方式 | 模型 | 怎么告诉它类别 |
+| --- | --- | --- |
+| 文本提示词 | [Grounding DINO](https://github.com/IDEA-Research/GroundingDINO) | `person. helmet. safety vest.` |
+| 视觉提示 | [YOLOE](https://docs.ultralytics.com/models/yoloe/) | 在参考图上画框当样例 |
+
+适合室内、工地、自定义类别还没有训练数据时，先批量预标，再人工改。
 
 ## 特点
 
-- **本地权重**：`models/grounding-dino-tiny/`，`local_files_only: true`，不会再去 Hugging Face 下载
-- **每个框一个类**：按类别 token 跨度打分，长标签列表自动分组推理
-- **先存规范 JSON，导出时再转格式**
+- **本地权重**：`models/grounding-dino-tiny/` 与 `models/yoloe/`，缺文件直接报错，不会联网下载
+- **每个框一个类**：DINO 按类别 token 跨度打分；长标签列表自动分组推理
+- **视觉样例**：参考图点两次组框，YOLOE 注入类别后再扫文件夹
+- **先存规范 JSON，导出时再转格式**；YOLO 导出为 `images/` + `labels/` + 相对路径 `data.yaml`，可直接训练
 - **显卡可配置**：`auto` / `cpu` / `cuda:0` / `cuda:1`，界面和命令行都能选
-- **同卡多模型**：一张卡上启动 `workers.replicas` 份模型，经 Redis 并行拉批量任务
+- **同卡多模型**：一张卡上启动 `workers.replicas` 份 DINO，经 Redis 并行拉批量任务
 - **账号 + PostgreSQL**：管理员建用户；每次上传是一个任务，进度落库
 - **中断后续跑**：重启后从未完成的图重新入队，已完成的不重跑
 - **定期清理**过期图片和标注（仅管理员）
@@ -23,13 +29,10 @@
     ▼
 app.py (Gradio)  或  prelabel.py (单进程批量)
     │
-    ├─ 单张预览：本进程加载一份 Grounding DINO
-    │
-    └─ 批量（redis.enabled=true）
-           入队 Redis  gdino:queue
-           worker.py × replicas   ← 同一张 GPU
-           进度 / 账号 → PostgreSQL
-           原图 / JSON / 预览 → 磁盘
+    ├─ 文本单张 / 批量：Grounding DINO
+    │     批量 + redis.enabled → gdino:queue → worker.py × replicas
+    ├─ 视觉提示：YOLOE（第一次点检测才加载；批量在本进程串行，不进 Redis）
+    └─ 进度 / 账号 → PostgreSQL；原图 / JSON / 预览 → 磁盘
 ```
 
 登录后文件落在 `data/users/<用户名>/jobs/<任务id>/`。CLI 和不走账号时用 `data/images`、`data/annotations`、`data/previews`。
@@ -37,15 +40,16 @@ app.py (Gradio)  或  prelabel.py (单进程批量)
 ## 目录
 
 ```
-app.py                      Gradio 界面（登录、预览、批量、导出）
+app.py                      Gradio 界面（登录、预览、批量、视觉提示、导出）
 prelabel.py                 命令行批量预标注（不经过 Redis）
-worker.py                   Redis 上的一份模型进程
+worker.py                   Redis 上的一份 Grounding DINO 进程
 start_workers.py            同一张卡拉起 replicas 份 worker
 cleanup.py                  按天数清理过期文件
 config.example.yaml         配置模板（复制为 config.yaml）
 src/
-  detector.py               推理、赋类、NMS、GPU 选择
-  prompts.py                提示词拆分
+  detector.py               Grounding DINO 推理、赋类、NMS、GPU 选择
+  yoloe_detector.py         YOLOE 视觉提示推理（懒加载）
+  prompts.py                文本提示词拆分
   visualize.py              画框
   store.py                  规范 JSON
   exporters.py              YOLO / COCO / LabelMe
@@ -53,7 +57,8 @@ src/
   db.py                     Postgres 用户与任务
   spawn.py                  拉起 / 停止 replica
   cleanup.py                过期文件删除
-models/grounding-dino-tiny/ 本地权重（须自行放入，约 690MB）
+models/grounding-dino-tiny/ 本地 DINO 权重（须自行放入，约 690MB）
+models/yoloe/               本地 YOLOE 权重（须自行放入，如 yoloe-11s-seg.pt）
 data/                       图片、标注、预览、导出
 deploy/                     systemd 示例
 ```
@@ -78,7 +83,9 @@ python -m pip install -r requirements.txt
 cp config.example.yaml config.yaml
 ```
 
-改 `model.device` / `gpu_id`、Redis、Postgres。`config.yaml` 已在 `.gitignore` 中，不要把密码推进仓库。
+改 `model.device` / `gpu_id`、Redis、Postgres、`yoloe.gpu_id`。
+
+**`config.yaml` 已在 `.gitignore`，不要提交。** 内网主机、数据库密码、管理员口令只写在这份本地文件里。仓库里的模板是 `config.example.yaml`（Postgres / Redis 默认 `127.0.0.1`，密码占位符 `CHANGE_ME`）。
 
 ## 权重（不联网）
 
@@ -163,6 +170,7 @@ Windows：`.\run_ui.ps1`。默认监听 `0.0.0.0:7860`。
 | 任务历史 | 打开已有任务、看可视化、导出已完成图 |
 | 单张预览 | 上传一张图 + 提示词，立刻画框 |
 | 文件夹批量预标注 | 浏览器选本机目录，上传后入队 |
+| 视觉提示预标注 | 参考图上点两次组框，YOLOE 按样例扫文件夹（本进程串行，不进 Redis） |
 | 导出 / 清理 | 从规范 JSON 转格式；管理员可按天数删过期文件 |
 | 管理员 | 创建 / 停用用户、重置密码 |
 
@@ -188,6 +196,30 @@ python start_workers.py
 
 tiny 大约每份 1.5–2GB 显存，别把卡撑满。界面预览还占一份 `model.gpu_id` 上的模型；worker 卡和界面卡相同的话把 replicas 算上这份。
 
+视觉提示用的 YOLOE **第一次点检测才加载**，不要和 `workers.gpu_id` 抢同一张已经堆满 replica 的卡。在 `config.yaml` 的 `yoloe.gpu_id` 里指定另一张卡。
+
+## 视觉提示预标注
+
+文本提示词找不到、或类别要用真实样例时，打开 **视觉提示预标注**：
+
+1. 填写类别（逗号分隔，**保留大小写**），例如 `charging_nest, robot`
+2. 上传参考图，在图上点两次组成框（左上 → 右下），选类别，点「加入视觉提示」。每个类别至少一框
+3. 单张：再上传目标图点「检测当前图」
+4. 批量：选文件夹或填服务器目录，点「开始视觉预标注」。**始终在界面进程串行**，不会进 `gdino:queue`
+
+把权重放到 `models/yoloe/`：
+
+```
+models/yoloe/yoloe-11s-seg.pt
+models/yoloe/yoloe-11m-seg.pt   # 可选
+models/yoloe/yoloe-11l-seg.pt
+models/yoloe/yoloe-26x-seg.pt
+```
+
+权重来自 Ultralytics YOLOE 发布文件，文件名不要改。缺文件会直接报错，不会去网上拉。依赖 `ultralytics==8.4.128`（`requirements.txt` 已钉死）。
+
+写出的规范 JSON 与文本预标注相同，可用同一套任务历史 / 导出。`prompt` 字段形如 `visual: charging_nest, robot`。
+
 ## 标注与导出
 
 规范标注（始终写入）：`data/annotations/<图名>.json` 或任务目录下的 `annotations/`。
@@ -212,14 +244,15 @@ tiny 大约每份 1.5–2GB 显存，别把卡撑满。界面预览还占一份 
 
 ```
 data/exports/
-  yolo/<图名>.txt     # class_id cx cy w h（归一化 0–1）
-  yolo/data.yaml
+  yolo/data.yaml          # path: .  train/val: images
+  yolo/images/<原图>
+  yolo/labels/<图名>.txt  # class_id cx cy w h（归一化 0–1）
   coco/annotations.json
   labelme/<图名>.json
   classes.json
 ```
 
-YOLO `data.yaml` 的 `names` 顺序 = 当时提示词顺序。换过提示词应重新导出，不要混用两套 `names`。
+YOLO 这一套可以直接给 Ultralytics 训练（`images/` 与 `labels/` 并列）。`data.yaml` 的 `names` 顺序优先用该任务写入 JSON 的 `classes`，不要把两套提示词的导出混在一个目录里。
 
 ## 中断后续跑
 
@@ -236,10 +269,11 @@ YOLO `data.yaml` 的 `names` 顺序 = 当时提示词顺序。换过提示词应
 
 ## 部署
 
-1. 拷贝代码 + `models/grounding-dino-tiny/` + 自己的 `config.yaml`
+1. 拷贝代码 + `models/grounding-dino-tiny/`（以及要用视觉提示时的 `models/yoloe/`）+ 自己的 `config.yaml`
 2. Python 3.12，按服务器 CUDA 装 PyTorch，再 `pip install -r requirements.txt`
 3. 需要批量并行时启动 Redis；需要账号时连已有 Postgres（启动时 `CREATE TABLE IF NOT EXISTS`）
-4. `python app.py`，或参考 `deploy/grounddino-prelabel.service` 做成 systemd（先改工作目录、用户、conda 路径）
+4. `python app.py`，或参考 `deploy/grounddino-prelabel.service` 做成 systemd（先改工作目录、用户、Python 路径）
+5. 不要把真实 IP、密码写进 README、示例配置或 service 文件
 
 `HF_HUB_OFFLINE=1` 和 `TRANSFORMERS_OFFLINE=1` 可防止进程在缺文件时试图联网。
 
