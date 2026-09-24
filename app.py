@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import atexit
+import json
 import shutil
 import socket
 import sys
@@ -11,7 +12,7 @@ import zipfile
 from pathlib import Path
 
 import gradio as gr
-from PIL import Image
+from PIL import Image, ImageDraw
 
 ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
@@ -20,7 +21,7 @@ if str(ROOT) not in sys.path:
 from src import db as pg
 from src.cleanup import cleanup
 from src.config import data_dirs, load_config
-from src.detector import GroundingDINODetector, device_choices, list_gpus
+from src.detector import Detection, GroundingDINODetector, device_choices, list_gpus
 from src.exporters import IMAGE_EXTS, export_from_records, export_from_store, list_images
 from src.prompts import normalize_prompt
 from src.queue import (
@@ -38,6 +39,15 @@ from src.queue import (
 from src.spawn import replica_count, spawn_replicas, stop_replicas, worker_gpu_id
 from src.store import build_record, detections_from_record, list_records, load_record, save_record
 from src.visualize import draw_detections
+from src.yoloe_detector import (
+    MODEL_OPTIONS as YOLOE_MODEL_OPTIONS,
+    VisualPrompt,
+    YOLOEVisualDetector,
+    normalize_model_key,
+    parse_visual_classes,
+    resolve_weights,
+    visual_caption,
+)
 
 BROWSE_PAGE = 12
 GALLERY_COLS = 6
@@ -117,10 +127,21 @@ LOCAL_ONLY = bool(MODEL_CFG.get("local_files_only", True))
 UI_CFG = CFG.get("ui", {})
 DIRS = data_dirs(CFG)
 CLEAN_CFG = CFG.get("cleanup", {})
+YOLOE_CFG = CFG.get("yoloe") or {}
+YOLOE_WEIGHTS_DIR = YOLOE_CFG.get("weights_dir", "models/yoloe")
+YOLOE_DEFAULT = str(YOLOE_CFG.get("default", "s") or "s")
+YOLOE_DEVICE = YOLOE_CFG.get("device", "auto")
+YOLOE_GPU_ID = YOLOE_CFG.get("gpu_id", 0)
+YOLOE_IMGSZ = int(YOLOE_CFG.get("imgsz", 960))
+YOLOE_CONF = float(YOLOE_CFG.get("confidence", 0.10))
+YOLOE_NMS = float(YOLOE_CFG.get("nms_iou", 0.50))
 
 _detector: GroundingDINODetector | None = None
 _status = "模型尚未加载"
 _worker_procs: list = []
+_yoloe: YOLOEVisualDetector | None = None
+_yoloe_key: tuple | None = None
+_yoloe_status = "YOLOE 尚未加载"
 
 
 def host_ipv4() -> str:
@@ -156,15 +177,23 @@ def gpu_summary() -> str:
     return "\n".join(lines)
 
 
-def _default_device_choice() -> str:
+def _device_choice_for(device: str, gpu_id) -> str:
     choices = device_choices()
-    configured = str(DEVICE or "auto").split()[0]
+    configured = str(device or "auto").split()[0]
     if configured.startswith("cuda") and ":" not in configured:
-        configured = f"cuda:{int(GPU_ID or 0)}"
+        configured = f"cuda:{int(gpu_id or 0)}"
     for c in choices:
         if c.split()[0] == configured:
             return c
     return choices[0] if choices else "auto"
+
+
+def _default_device_choice() -> str:
+    return _device_choice_for(DEVICE, GPU_ID)
+
+
+def _yoloe_device_choice() -> str:
+    return _device_choice_for(YOLOE_DEVICE, YOLOE_GPU_ID)
 
 
 def get_detector(device: str | None = None) -> GroundingDINODetector:
@@ -202,6 +231,47 @@ def get_detector(device: str | None = None) -> GroundingDINODetector:
         f"{time.perf_counter() - t0:.1f}s"
     )
     return _detector
+
+
+def get_yoloe_detector(device: str | None = None, model_key: str | None = None) -> YOLOEVisualDetector:
+    global _yoloe, _yoloe_key, _yoloe_status
+    key = normalize_model_key(model_key or YOLOE_DEFAULT)
+    want = (device or YOLOE_DEVICE or "auto").split()[0]
+    gpu_id = None
+    if want in ("auto", "cuda"):
+        gpu_id = int(YOLOE_GPU_ID or 0)
+    stamp = (key, want, gpu_id)
+    if _yoloe is not None and _yoloe_key == stamp:
+        return _yoloe
+    if _yoloe is not None:
+        old = _yoloe
+        _yoloe = None
+        _yoloe_key = None
+        del old
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+    weights = resolve_weights(key, YOLOE_WEIGHTS_DIR)
+    _yoloe_status = f"正在加载 YOLOE {weights.name} → {want} …"
+    det = YOLOEVisualDetector(
+        weights=weights,
+        device=want,
+        gpu_id=gpu_id,
+        imgsz=YOLOE_IMGSZ,
+    )
+    t0 = time.perf_counter()
+    det.load()
+    _yoloe = det
+    _yoloe_key = stamp
+    _yoloe_status = (
+        f"已加载 YOLOE {weights.name}  |  device={det.device}  |  "
+        f"{time.perf_counter() - t0:.1f}s"
+    )
+    return _yoloe
 
 
 def _run_one(
@@ -1276,6 +1346,391 @@ def do_cleanup(keep_days, include_exports, dry_run, user=None):
     return "\n".join(lines)
 
 
+def _pil_rgb(image) -> Image.Image | None:
+    if image is None:
+        return None
+    if isinstance(image, Image.Image):
+        return image.convert("RGB")
+    return Image.fromarray(image).convert("RGB")
+
+
+def _select_xy(evt) -> tuple[int, int] | None:
+    if evt is None:
+        return None
+    idx = getattr(evt, "index", None)
+    if isinstance(idx, (list, tuple)) and len(idx) >= 2:
+        return int(idx[0]), int(idx[1])
+    value = getattr(evt, "value", None)
+    if isinstance(value, dict):
+        x = value.get("x")
+        y = value.get("y")
+        if x is not None and y is not None:
+            return int(x), int(y)
+    return None
+
+
+def _draw_box_preview(image: Image.Image, xyxy, extra: list | None = None) -> Image.Image:
+    vis = image.copy()
+    draw = ImageDraw.Draw(vis)
+    boxes = list(extra or [])
+    if xyxy:
+        boxes.append(xyxy)
+    for box in boxes:
+        x1, y1, x2, y2 = (int(v) for v in box)
+        draw.rectangle([x1, y1, x2, y2], outline=(220, 38, 38), width=3)
+    return vis
+
+
+def _prompt_table(prompts: list | None):
+    rows = []
+    for i, item in enumerate(prompts or []):
+        box = item.get("xyxy") or [0, 0, 0, 0]
+        rows.append([i, item.get("label", ""), *box])
+    return rows
+
+
+def _set_ref_raw(image):
+    img = _pil_rgb(image)
+    return img, {"p1": None, "xyxy": None}, "上传后在图上点两次组框：先左上，再右下。"
+
+
+def _click_visual_ref(evt: gr.SelectData, raw, click_state, prompts):
+    empty_state = {"p1": None, "xyxy": None}
+    img = _pil_rgb(raw)
+    if img is None:
+        return None, empty_state, "请先上传参考图，再点两次组成框。"
+    xy = _select_xy(evt)
+    if xy is None:
+        return img, click_state or empty_state, "点参考图：第一次左上，第二次右下。"
+    state = dict(click_state or empty_state)
+    extra = [p.get("xyxy") for p in (prompts or []) if p.get("xyxy")]
+    if not state.get("p1"):
+        state = {"p1": list(xy), "xyxy": None}
+        vis = _draw_box_preview(img, None, extra)
+        return vis, state, f"已记下 ({xy[0]}, {xy[1]})，再点对角。"
+    x1, y1 = state["p1"]
+    x2, y2 = xy
+    if x2 < x1:
+        x1, x2 = x2, x1
+    if y2 < y1:
+        y1, y2 = y2, y1
+    if x2 - x1 < 4 or y2 - y1 < 4:
+        state = {"p1": None, "xyxy": None}
+        return img, state, "框太小，请重新点两次。"
+    xyxy = [int(x1), int(y1), int(x2), int(y2)]
+    state = {"p1": None, "xyxy": xyxy}
+    vis = _draw_box_preview(img, xyxy, extra)
+    return vis, state, f"当前框 {xyxy[0]},{xyxy[1]} — {xyxy[2]},{xyxy[3]}，选类别后点「加入视觉提示」。"
+
+
+def _class_choices(text: str):
+    names = parse_visual_classes(text or "")
+    value = names[0] if names else None
+    return gr.update(choices=names, value=value)
+
+
+def add_visual_prompt(raw, click_state, class_name, class_text, prompts):
+    names = parse_visual_classes(class_text or "")
+    img = _pil_rgb(raw)
+    prompts = list(prompts or [])
+    extra = [p.get("xyxy") for p in prompts if p.get("xyxy")]
+    if img is None:
+        return None, prompts, _prompt_table(prompts), click_state or {"p1": None, "xyxy": None}, "请先上传参考图。"
+    if not names:
+        return img, prompts, _prompt_table(prompts), click_state, "请填写类别名，例如：charging_nest, robot"
+    label = (class_name or "").strip() or names[0]
+    if label not in names:
+        return img, prompts, _prompt_table(prompts), click_state, f"类别「{label}」不在列表里。"
+    xyxy = (click_state or {}).get("xyxy")
+    if not xyxy:
+        return img, prompts, _prompt_table(prompts), click_state, "请在参考图上点两次组成框。"
+    class_id = names.index(label)
+    prompts.append(
+        {
+            "label": label,
+            "class_id": class_id,
+            "xyxy": [int(v) for v in xyxy],
+            "image": img.copy(),
+        }
+    )
+    extra.append(xyxy)
+    vis = _draw_box_preview(img, None, extra)
+    reset = {"p1": None, "xyxy": None}
+    return vis, prompts, _prompt_table(prompts), reset, f"已加入 {label}  {xyxy}，共 {len(prompts)} 个提示。"
+
+
+def clear_visual_prompts(raw):
+    img = _pil_rgb(raw)
+    return img, [], [], {"p1": None, "xyxy": None}, "已清空视觉提示。"
+
+
+def _prompts_to_visual(prompts) -> list[VisualPrompt]:
+    out: list[VisualPrompt] = []
+    for item in prompts or []:
+        image = item.get("image")
+        if image is None:
+            continue
+        box = item.get("xyxy") or [0, 0, 0, 0]
+        out.append(
+            VisualPrompt(
+                image=_pil_rgb(image),
+                xyxy=(int(box[0]), int(box[1]), int(box[2]), int(box[3])),
+                class_id=int(item.get("class_id") or 0),
+            )
+        )
+    return out
+
+
+def _manuals_for_image(image: Image.Image, names: list[str], prompts) -> list:
+    manuals = []
+    if image is None:
+        return manuals
+    target = image.tobytes()
+    for item in prompts or []:
+        ref = item.get("image")
+        if ref is None or _pil_rgb(ref).tobytes() != target:
+            continue
+        box = item.get("xyxy") or [0, 0, 0, 0]
+        idx = int(item.get("class_id") or 0)
+        label = names[idx] if 0 <= idx < len(names) else item.get("label") or "object"
+        manuals.append(Detection(label=label, score=1.0, xyxy=(int(box[0]), int(box[1]), int(box[2]), int(box[3]))))
+    return manuals
+
+
+def _save_visual_prompt_bundle(dest_dir: Path, names: list[str], prompts) -> None:
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    payload = {"classes": names, "prompts": []}
+    for i, item in enumerate(prompts or []):
+        image = _pil_rgb(item.get("image"))
+        filename = f"ref_{i:03d}.png"
+        if image is not None:
+            image.save(dest_dir / filename)
+        payload["prompts"].append(
+            {
+                "image": filename,
+                "xyxy": item.get("xyxy"),
+                "class_id": int(item.get("class_id") or 0),
+                "label": item.get("label"),
+            }
+        )
+    (dest_dir / "visual_prompts.json").write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def _prepare_yoloe(class_text, prompts, model_key, device):
+    names = parse_visual_classes(class_text or "")
+    vis_prompts = _prompts_to_visual(prompts)
+    if not names:
+        raise ValueError("请填写类别名，例如：charging_nest, robot")
+    if not vis_prompts:
+        raise ValueError("请至少加入一个视觉提示框。")
+    missing = [n for i, n in enumerate(names) if not any(p.class_id == i for p in vis_prompts)]
+    if missing:
+        raise ValueError("这些类别还没有画框：" + ", ".join(missing))
+    det = get_yoloe_detector(device, model_key)
+    det.set_visual_classes(names, vis_prompts, strategy="semantic")
+    return det, names
+
+
+def predict_visual_single(image, class_text, prompts, model_key, conf, nms_iou, save_ann, device, user):
+    err = _need_login(user)
+    if err:
+        return None, [], err
+    img = _pil_rgb(image)
+    if img is None:
+        return None, [], "请上传要检测的图片。"
+    try:
+        det, names = _prepare_yoloe(class_text, prompts, model_key, device)
+        manuals = _manuals_for_image(img, names, prompts)
+        detections = det.detect(img, confidence=float(conf), nms_iou=float(nms_iou), manuals=manuals)
+    except Exception as exc:
+        return img, [], str(exc)
+    vis = draw_detections(img, detections)
+    rows = [[d.label, f"{d.score:.3f}", *d.xyxy] for d in detections]
+    caption = visual_caption(names)
+    msg = f"{_yoloe_status}\n{caption}\n检测到 {len(detections)} 个目标。"
+    if save_ann:
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        if user and pg.postgres_enabled(CFG):
+            job_id = new_job_id()
+            dirs = pg.job_dirs_for(user["username"], job_id, CFG)
+            img_path = dirs["images"] / f"ui_{stamp}.jpg"
+            img.save(img_path, quality=92)
+            record = build_record(
+                img_path, img, detections, names, caption,
+                model_id=str(det.weights), box_threshold=float(conf), text_threshold=0.0, nms_iou=float(nms_iou),
+            )
+            ann_path = save_record(record, dirs["annotations"], img_path.stem)
+            vis_path = dirs["previews"] / f"{img_path.stem}_vis.jpg"
+            vis.save(vis_path, quality=92)
+            _save_visual_prompt_bundle(dirs["root"] / "prompts", names, prompts)
+            pg.create_job(
+                user,
+                job_id=job_id,
+                prompt=caption,
+                classes=names,
+                box_threshold=float(conf),
+                text_threshold=0.0,
+                nms_iou=float(nms_iou),
+                save_preview=True,
+                model=str(det.weights),
+                image_rows=[{"orig_name": img_path.name, "image_path": str(img_path)}],
+                cfg=CFG,
+            )
+            pg.complete_image(
+                job_id, str(img_path), ok=True, box_count=len(detections),
+                ann_path=str(ann_path), preview_path=str(vis_path), cfg=CFG,
+            )
+            msg += f"\n已记入任务 {job_id}\n标注：{ann_path}"
+        else:
+            DIRS["images"].mkdir(parents=True, exist_ok=True)
+            DIRS["annotations"].mkdir(parents=True, exist_ok=True)
+            img_path = DIRS["images"] / f"ui_{stamp}.jpg"
+            img.save(img_path, quality=92)
+            record = build_record(
+                img_path, img, detections, names, caption,
+                model_id=str(det.weights), box_threshold=float(conf), text_threshold=0.0, nms_iou=float(nms_iou),
+            )
+            save_record(record, DIRS["annotations"], img_path.stem)
+            msg += f"\n已写入规范标注：{DIRS['annotations'] / (img_path.stem + '.json')}"
+    return vis, rows, msg
+
+
+def _run_visual_serial_job(
+    job_id, pg_job, saved, names, prompts, model_key, conf, nms_iou, save_preview, device, progress,
+):
+    stored = [str(p) for p, _ in saved]
+    try:
+        det, names = _prepare_yoloe(", ".join(names), prompts, model_key, device)
+    except Exception as exc:
+        return str(exc), job_id, stored, [], 1, str(exc), _bar_html(0, str(exc))
+    caption = visual_caption(names)
+    total = 0
+    dirs = _job_file_dirs(job_id)
+    dirs["annotations"].mkdir(parents=True, exist_ok=True)
+    dirs["previews"].mkdir(parents=True, exist_ok=True)
+    prompt_root = Path(dirs["annotations"]).parent / "prompts"
+    _save_visual_prompt_bundle(prompt_root, names, prompts)
+
+    for path, _orig in progress.tqdm(saved, desc="视觉预标注"):
+        image = Image.open(path).convert("RGB")
+        manuals = _manuals_for_image(image, names, prompts)
+        detections = det.detect(image, confidence=float(conf), nms_iou=float(nms_iou), manuals=manuals)
+        total += len(detections)
+        record = build_record(
+            path, image, detections, names, caption,
+            model_id=str(det.weights), box_threshold=float(conf), text_threshold=0.0, nms_iou=float(nms_iou),
+        )
+        ann_path = save_record(record, dirs["annotations"], path.stem)
+        vis = draw_detections(image, detections)
+        preview_path = None
+        if save_preview:
+            preview_path = dirs["previews"] / f"{path.stem}_vis.jpg"
+            vis.save(preview_path, quality=92)
+        if pg_job:
+            pg.complete_image(
+                job_id, str(path), ok=True, box_count=len(detections),
+                ann_path=str(ann_path),
+                preview_path=str(preview_path) if preview_path else None,
+                cfg=CFG,
+            )
+
+    msg = (
+        f"{_yoloe_status}\n"
+        f"{caption}\n"
+        f"完成 {len(saved)} 张，共 {total} 个框（视觉提示，本进程串行，未走 Redis）。\n"
+        f"任务 {job_id}"
+    )
+    items, page, info, stored = page_gallery(job_id, stored, 1, BROWSE_PAGE)
+    pct, text = _job_progress_ui(job_id)
+    return msg, job_id, stored, items, page, info, _bar_html(pct, text)
+
+
+def _submit_visual_job(user, names, conf, nms_iou, save_preview, image_rows, model_id, job_id=None):
+    job_id = job_id or new_job_id()
+    caption = visual_caption(names)
+    pg_job = None
+    if user and pg.postgres_enabled(CFG):
+        pg_job = pg.create_job(
+            user,
+            job_id=job_id,
+            prompt=caption,
+            classes=names,
+            box_threshold=float(conf),
+            text_threshold=0.0,
+            nms_iou=float(nms_iou),
+            save_preview=bool(save_preview),
+            model=model_id,
+            image_rows=image_rows,
+            cfg=CFG,
+        )
+    return job_id, pg_job
+
+
+def predict_visual_batch(
+    files, class_text, prompts, model_key, conf, nms_iou, save_preview, device, user, progress=gr.Progress(),
+):
+    empty = _empty_browse()
+    err = _need_login(user)
+    if err:
+        return err, *empty
+    names = parse_visual_classes(class_text or "")
+    if not names:
+        return "请填写类别名，例如：charging_nest, robot", *empty
+    if not _prompts_to_visual(prompts):
+        return "请至少加入一个视觉提示框。", *empty
+    job_id = new_job_id()
+    if user and pg.postgres_enabled(CFG):
+        dest = pg.job_dirs_for(user["username"], job_id, CFG)["images"]
+    else:
+        dest = DIRS["images"]
+    saved = _save_uploads(files, dest, progress)
+    if not saved:
+        return "请从本机选择文件夹 / 多张图片上传，或改用服务器目录。", *empty
+    image_rows = [{"orig_name": orig, "image_path": str(p)} for p, orig in saved]
+    try:
+        weights = str(resolve_weights(model_key or YOLOE_DEFAULT, YOLOE_WEIGHTS_DIR))
+        job_id, pg_job = _submit_visual_job(
+            user, names, conf, nms_iou, save_preview, image_rows, weights, job_id=job_id,
+        )
+    except Exception as exc:
+        return str(exc), *empty
+    return _run_visual_serial_job(
+        job_id, pg_job, saved, names, prompts, model_key, conf, nms_iou, save_preview, device, progress,
+    )
+
+
+def predict_visual_server_dir(
+    folder, class_text, prompts, model_key, conf, nms_iou, save_preview, device, user, progress=gr.Progress(),
+):
+    empty = _empty_browse()
+    err = _need_login(user)
+    if err:
+        return err, *empty
+    names = parse_visual_classes(class_text or "")
+    if not names:
+        return "请填写类别名，例如：charging_nest, robot", *empty
+    if not _prompts_to_visual(prompts):
+        return "请至少加入一个视觉提示框。", *empty
+    folder = (folder or "").strip()
+    if not folder:
+        return "请填写服务器上的图片目录。", *empty
+    paths = _collect_server_images(folder)
+    if not paths:
+        return f"目录不存在或没有图片：{folder}", *empty
+    image_rows = [{"orig_name": p.name, "image_path": str(p.resolve())} for p in paths]
+    saved = [(p, p.name) for p in paths]
+    try:
+        weights = str(resolve_weights(model_key or YOLOE_DEFAULT, YOLOE_WEIGHTS_DIR))
+        job_id, pg_job = _submit_visual_job(user, names, conf, nms_iou, save_preview, image_rows, weights)
+    except Exception as exc:
+        return str(exc), *empty
+    return _run_visual_serial_job(
+        job_id, pg_job, saved, names, prompts, model_key, conf, nms_iou, save_preview, device, progress,
+    )
+
+
 def store_status(user=None, job_id="") -> str:
     job_id = (job_id or "").strip()
     dirs = _job_file_dirs(job_id) if job_id else DIRS
@@ -1551,6 +2006,127 @@ def build_ui() -> gr.Blocks:
                         show_clicked,
                         inputs=[job_id_box, stored_paths, page_num, page_size],
                         outputs=[vis_img, vis_table, vis_info],
+                    )
+
+                with gr.Tab("视觉提示预标注"):
+                    gr.Markdown(
+                        "用参考图上的框当视觉提示（YOLOE），写出和文本预标注相同的规范 JSON。"
+                        "批量在本进程串行，不进 Redis。权重放在 `models/yoloe/`。"
+                    )
+                    vp_prompt_state = gr.State([])
+                    vp_click_state = gr.State({"p1": None, "xyxy": None})
+                    vp_ref_raw = gr.State(None)
+                    with gr.Row():
+                        vp_classes = gr.Textbox(
+                            label="类别（逗号分隔，保留大小写）",
+                            placeholder="charging_nest, robot",
+                            lines=1,
+                            scale=3,
+                        )
+                        vp_class_pick = gr.Dropdown(label="当前框的类别", choices=[], scale=1)
+                        vp_model = gr.Dropdown(
+                            choices=[(f"{k} · {v['label']}", k) for k, v in YOLOE_MODEL_OPTIONS.items()],
+                            value=YOLOE_DEFAULT if YOLOE_DEFAULT in YOLOE_MODEL_OPTIONS else "s",
+                            label="YOLOE",
+                            scale=1,
+                        )
+                    with gr.Row():
+                        vp_device = gr.Dropdown(
+                            choices=device_choices(),
+                            value=_yoloe_device_choice(),
+                            label="推理设备",
+                            scale=2,
+                        )
+                        vp_conf = gr.Slider(0.01, 0.90, value=YOLOE_CONF, step=0.01, label="conf")
+                        vp_nms = gr.Slider(0.10, 0.95, value=YOLOE_NMS, step=0.05, label="NMS")
+                    with gr.Row():
+                        with gr.Column(scale=1):
+                            vp_ref = gr.Image(type="pil", label="参考图（点两次组框：左上 → 右下）", height=360)
+                            vp_click_info = gr.Textbox(label="画框提示", lines=2, interactive=False)
+                            with gr.Row():
+                                vp_add_btn = gr.Button("加入视觉提示", variant="primary")
+                                vp_clear_btn = gr.Button("清空提示")
+                            vp_prompt_table = gr.Dataframe(
+                                headers=["#", "label", "x1", "y1", "x2", "y2"],
+                                label="已加入的视觉提示",
+                                interactive=False,
+                            )
+                        with gr.Column(scale=1):
+                            vp_target = gr.Image(type="pil", label="单张目标图", height=360)
+                            vp_out = gr.Image(type="pil", label="可视化", height=360)
+                    vp_table = gr.Dataframe(
+                        headers=["label", "score", "x1", "y1", "x2", "y2"],
+                        label="检测结果",
+                        interactive=False,
+                    )
+                    vp_save_ann = gr.Checkbox(value=False, label="写入规范标注（会新建 1 张图的任务）")
+                    vp_single_status = gr.Textbox(label="单张状态", lines=3)
+                    vp_single_btn = gr.Button("检测当前图", variant="primary")
+                    gr.Markdown("### 文件夹批量（串行，不进 Redis）")
+                    with gr.Row():
+                        vp_uploads = gr.File(
+                            label="本机文件夹",
+                            file_count="directory",
+                            type="filepath",
+                        )
+                        vp_server_dir = gr.Textbox(label="或服务器目录（不拷贝）", placeholder="/data/images/batch01")
+                    vp_save_preview = gr.Checkbox(value=True, label="保存可视化图")
+                    with gr.Row():
+                        vp_batch_btn = gr.Button("开始视觉预标注", variant="primary")
+                        vp_server_btn = gr.Button("从服务器目录跑")
+                    vp_batch_status = gr.Textbox(label="批量进度", lines=6)
+                    vp_gallery = gr.Gallery(
+                        label="结果缩略图",
+                        columns=6,
+                        height=220,
+                        object_fit="contain",
+                        allow_preview=False,
+                    )
+
+                    vp_classes.change(_class_choices, inputs=[vp_classes], outputs=[vp_class_pick])
+                    vp_ref.upload(
+                        _set_ref_raw,
+                        inputs=[vp_ref],
+                        outputs=[vp_ref_raw, vp_click_state, vp_click_info],
+                    )
+                    vp_ref.select(
+                        _click_visual_ref,
+                        inputs=[vp_ref_raw, vp_click_state, vp_prompt_state],
+                        outputs=[vp_ref, vp_click_state, vp_click_info],
+                    )
+                    vp_add_btn.click(
+                        add_visual_prompt,
+                        inputs=[vp_ref_raw, vp_click_state, vp_class_pick, vp_classes, vp_prompt_state],
+                        outputs=[vp_ref, vp_prompt_state, vp_prompt_table, vp_click_state, vp_click_info],
+                    )
+                    vp_clear_btn.click(
+                        clear_visual_prompts,
+                        inputs=[vp_ref_raw],
+                        outputs=[vp_ref, vp_prompt_state, vp_prompt_table, vp_click_state, vp_click_info],
+                    )
+                    vp_single_btn.click(
+                        predict_visual_single,
+                        inputs=[
+                            vp_target, vp_classes, vp_prompt_state, vp_model,
+                            vp_conf, vp_nms, vp_save_ann, vp_device, user_state,
+                        ],
+                        outputs=[vp_out, vp_table, vp_single_status],
+                    )
+                    vp_batch_btn.click(
+                        predict_visual_batch,
+                        inputs=[
+                            vp_uploads, vp_classes, vp_prompt_state, vp_model,
+                            vp_conf, vp_nms, vp_save_preview, vp_device, user_state,
+                        ],
+                        outputs=[vp_batch_status, job_id_box, stored_paths, vp_gallery, page_num, page_info, job_bar],
+                    )
+                    vp_server_btn.click(
+                        predict_visual_server_dir,
+                        inputs=[
+                            vp_server_dir, vp_classes, vp_prompt_state, vp_model,
+                            vp_conf, vp_nms, vp_save_preview, vp_device, user_state,
+                        ],
+                        outputs=[vp_batch_status, job_id_box, stored_paths, vp_gallery, page_num, page_info, job_bar],
                     )
 
                 with gr.Tab("导出 / 清理"):
