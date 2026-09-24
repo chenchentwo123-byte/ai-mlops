@@ -56,6 +56,17 @@ workers:
   replicas: 2
   lease_seconds: 180    # running 心跳超时后才允许别人抢走 / 重启回收
 
+# YOLOE 视觉提示预标注（Gradio「视觉提示预标注」页，懒加载，不进 Redis）。
+# 权重放到 models/yoloe/，例如 yoloe-11s-seg.pt。不要和 workers.gpu_id 抢同一张已堆满 replica 的卡。
+yoloe:
+  weights_dir: models/yoloe
+  default: s          # s | m | l | x
+  device: auto
+  gpu_id: 0
+  imgsz: 960
+  confidence: 0.10
+  nms_iou: 0.50
+
 # 账号 / 任务台账。图仍在磁盘，进度和用户在 Postgres。
 # 启动时会自动建表，并确保默认管理员存在。
 postgres:

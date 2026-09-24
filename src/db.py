@@ -44,8 +44,8 @@ def connect(cfg: dict | None = None):
     kwargs: dict[str, Any] = {
         "host": str(pcfg.get("host", "127.0.0.1")),
         "port": int(pcfg.get("port", 5432)),
-        "dbname": str(pcfg.get("db", "ai-mlops")),
-        "user": str(pcfg.get("user", "alg_cv")),
+        "dbname": str(pcfg.get("db", "gdino")),
+        "user": str(pcfg.get("user", "gdino")),
         "autocommit": True,
         "row_factory": dict_row,
     }

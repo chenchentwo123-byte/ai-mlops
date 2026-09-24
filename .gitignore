@@ -11,9 +11,12 @@ config.yaml
 
 # 权重约 690MB，单独拷贝，不要推进 Git。
 *.safetensors
+*.pt
 *.weights.lock
 models/grounding-dino-tiny/*
 !models/grounding-dino-tiny/.gitkeep
+models/yoloe/*
+!models/yoloe/.gitkeep
 
 data/images/*
 !data/images/.gitkeep
@@ -27,6 +30,7 @@ data/labels/
 data/users/
 
 logs/
+backup_*/
 .claude/
 .idea/
 .vscode/
