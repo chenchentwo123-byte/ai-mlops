@@ -164,7 +164,7 @@ def init_db(cfg: dict | None = None) -> str:
             conn.execute(sql)
         pcfg = postgres_cfg(cfg)
         admin_name = _safe_username(str(pcfg.get("admin_username") or "admin"))
-        admin_pass = str(pcfg.get("admin_password") or "admin123")
+        admin_pass = str(pcfg.get("admin_password") or "CHANGE_ME")
         row = conn.execute(
             "SELECT id FROM users WHERE username = %s", (admin_name,)
         ).fetchone()
